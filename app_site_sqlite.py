@@ -7,6 +7,7 @@ import math
 import re
 import sqlite3
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +26,22 @@ st.set_page_config(
 )
 
 APP_DIR = Path(__file__).resolve().parent
+DB_URL = "https://github.com/loickmbemba6-dev/SPACE_OBSERVATORY_V2/releases/download/v1.0.0/supernovae_complet.db"
 DB_FILE = Path(__file__).resolve().parent / "supernovae_complet.db"
 # Optional override for deployment or a different local location:
 # set SPACE_OBSERVATORY_DB=D:\\path\\to\\supernovae_complet.db
 import os
 if os.environ.get("SPACE_OBSERVATORY_DB"):
     DB_FILE = Path(os.environ["SPACE_OBSERVATORY_DB"]).expanduser().resolve()
+elif not DB_FILE.is_file():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_db = DB_FILE.with_suffix(DB_FILE.suffix + ".download")
+    try:
+        urllib.request.urlretrieve(DB_URL, temp_db)
+        os.replace(temp_db, DB_FILE)
+    finally:
+        if temp_db.exists():
+            temp_db.unlink()
 
 TABLE = "supernovae"
 PAGE_SIZES = [25, 50, 100, 250]
