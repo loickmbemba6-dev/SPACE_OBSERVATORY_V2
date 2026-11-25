@@ -14,6 +14,8 @@ from typing import Any
 
 import pandas as pd
 import plotly.express as px
+px.defaults.template = "plotly_dark"
+px.defaults.color_discrete_sequence = ["#F4C542", "#38BDF8", "#A78BFA", "#34D399", "#FB7185"]
 import streamlit as st
 
 # -----------------------------------------------------------------------------
