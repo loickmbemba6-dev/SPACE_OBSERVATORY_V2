@@ -400,6 +400,157 @@ def get_filter_sql(search: str, selected_type: str, use_z: bool, max_z: float):
         params.append(float(max_z))
     return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
 
+
+
+# -----------------------------------------------------------------------------
+# Combined catalogue: main database + Rochester Astronomy
+# -----------------------------------------------------------------------------
+
+def catalogue_connection():
+    conn = get_connection()
+    if not ROCHESTER_DB_FILE.is_file():
+        conn.close()
+        raise FileNotFoundError(str(ROCHESTER_DB_FILE))
+    conn.execute(
+        "ATTACH DATABASE ? AS roch",
+        (ROCHESTER_DB_FILE.as_uri() + "?mode=ro",)
+    )
+    return conn
+
+
+def catalogue_cte():
+    return """
+        WITH combined AS (
+            SELECT
+                rowid AS _id,
+                name,
+                claimedtype,
+                redshift,
+                discoverdate,
+                host,
+                alias,
+                'Main catalogue' AS source
+            FROM supernovae
+
+            UNION ALL
+
+            SELECT
+                id AS _id,
+                name,
+                claimedtype,
+                redshift,
+                CAST(discovery_year AS TEXT) AS discoverdate,
+                host,
+                aka AS alias,
+                'Rochester Astronomy' AS source
+            FROM roch.rochester
+        )
+    """
+
+
+def catalogue_types():
+    conn = catalogue_connection()
+    try:
+        sql = catalogue_cte() + """
+            SELECT DISTINCT claimedtype
+            FROM combined
+            WHERE claimedtype IS NOT NULL
+              AND TRIM(claimedtype) <> ''
+            ORDER BY claimedtype
+        """
+        return [str(r[0]) for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
+
+
+def catalogue_filters(search, selected_type, use_z, max_z):
+    clauses = []
+    params = []
+
+    if search.strip():
+        pattern = "%" + search.strip() + "%"
+        clauses.append("""
+            (
+                COALESCE(name,'') LIKE ? COLLATE NOCASE
+                OR COALESCE(alias,'') LIKE ? COLLATE NOCASE
+                OR COALESCE(host,'') LIKE ? COLLATE NOCASE
+                OR COALESCE(claimedtype,'') LIKE ? COLLATE NOCASE
+            )
+        """)
+        params.extend([pattern] * 4)
+
+    if selected_type != "__ALL__":
+        clauses.append("claimedtype = ?")
+        params.append(selected_type)
+
+    if use_z:
+        clauses.append(
+            "is_valid_number(redshift)=1 "
+            "AND CAST(TRIM(redshift) AS REAL) <= ?"
+        )
+        params.append(float(max_z))
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, params
+
+
+def catalogue_count(where, params):
+    conn = catalogue_connection()
+    try:
+        sql = catalogue_cte() + " SELECT COUNT(*) FROM combined " + where
+        return int(conn.execute(sql, params).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def catalogue_page(where, params, limit, offset):
+    conn = catalogue_connection()
+    try:
+        sql = catalogue_cte() + """
+            SELECT _id, name, claimedtype, redshift,
+                   discoverdate, host, source
+            FROM combined
+        """ + where + """
+            ORDER BY discoverdate DESC, name COLLATE NOCASE
+            LIMIT ? OFFSET ?
+        """
+        return pd.read_sql_query(
+            sql, conn, params=params + [int(limit), int(offset)]
+        )
+    finally:
+        conn.close()
+
+
+def catalogue_detail(source, record_id):
+    conn = catalogue_connection()
+    try:
+        if source == "Rochester Astronomy":
+            sql = "SELECT * FROM roch.rochester WHERE id=?"
+        else:
+            sql = (
+                "SELECT rowid AS _rowid_, * "
+                "FROM supernovae WHERE rowid=?"
+            )
+        return pd.read_sql_query(sql, conn, params=[int(record_id)])
+    finally:
+        conn.close()
+
+
+def catalogue_export(where, params):
+    conn = catalogue_connection()
+    try:
+        sql = catalogue_cte() + """
+            SELECT name, claimedtype, redshift, discoverdate,
+                   host, alias, source
+            FROM combined
+        """ + where + """
+            ORDER BY discoverdate DESC, name COLLATE NOCASE
+        """
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
 # -----------------------------------------------------------------------------
 # Sidebar / language
 # -----------------------------------------------------------------------------
@@ -621,125 +772,209 @@ if page == t["dashboard"]:
         st.info(t["no_redshift"])
 
 # -----------------------------------------------------------------------------
-# Catalogue
+# Catalogue — combined main and Rochester records
 # -----------------------------------------------------------------------------
 elif page == t["catalogue"]:
     st.subheader(t["catalogue"])
-    type_rows = query_df(f"SELECT DISTINCT claimedtype FROM {quote_identifier(TABLE)} WHERE claimedtype IS NOT NULL AND TRIM(claimedtype)<>'' ORDER BY claimedtype")
-    type_values = [str(x) for x in type_rows["claimedtype"].tolist()]
+    try:
+        type_values = catalogue_types()
+    except Exception as exc:
+        st.error("Catalogue connection error: " + str(exc))
+        st.stop()
+
     with st.container(border=True):
-        search = st.text_input(t["search"], placeholder=t["search_hint"], key="catalogue_search")
-        f1, f2, f3 = st.columns([1.2, 1, 1])
-        with f1:
-            type_choice = st.selectbox(t["type_filter"], [t["all_types"]] + type_values, key="type_choice")
-            selected_type = "__ALL__" if type_choice == t["all_types"] else type_choice
-        with f2:
-            use_z = st.checkbox(t["redshift_filter"], value=False, key="use_redshift")
-        with f3:
-            max_z = st.number_input(t["max_redshift"], min_value=0.0, max_value=20.0, value=1.5, step=0.1, disabled=not use_z, key="max_redshift")
-        page_size = st.selectbox(t["rows_per_page"], PAGE_SIZES, index=1, key="page_size")
-
-    where_sql, params = get_filter_sql(search, selected_type, use_z, max_z)
-    count_row = query_one(f"SELECT COUNT(*) AS n FROM {quote_identifier(TABLE)}{where_sql}", params)
-    filtered_total = int(count_row["n"])
-    pages = max(1, math.ceil(filtered_total / page_size))
-    if "catalogue_page" not in st.session_state:
-        st.session_state.catalogue_page = 1
-    st.session_state.catalogue_page = min(max(1, int(st.session_state.catalogue_page)), pages)
-    p1, p2, p3 = st.columns([1, 2, 1])
-    with p1:
-        if st.button("←", disabled=st.session_state.catalogue_page <= 1, key="prev_page"):
-            st.session_state.catalogue_page -= 1
-            st.rerun()
-    with p2:
-        st.markdown(f"<div style='text-align:center;padding-top:8px'>{t['page']} <b>{st.session_state.catalogue_page}</b> {t['of']} {pages} · {t['records_found']}: <b>{filtered_total:,}</b></div>", unsafe_allow_html=True)
-    with p3:
-        if st.button("→", disabled=st.session_state.catalogue_page >= pages, key="next_page"):
-            st.session_state.catalogue_page += 1
-            st.rerun()
-
-    offset = (st.session_state.catalogue_page - 1) * page_size
-    preview_cols = [c for c in ["name", "claimedtype", "redshift", "discoverdate", "host"] if c in columns]
-    select_cols = ", ".join(quote_identifier(c) for c in preview_cols)
-    page_df = query_df(f"SELECT rowid AS _rowid_, {select_cols} FROM {quote_identifier(TABLE)}{where_sql} ORDER BY rowid LIMIT ? OFFSET ?", params + [page_size, offset])
-    st.subheader(t["results"])
-    if page_df.empty:
-        st.info(t["no_records"])
-    else:
-        display_df = page_df.drop(columns=["_rowid_"])
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.subheader(t["details"])
-        row_options = page_df["_rowid_"].astype(int).tolist()
-        row_labels = {}
-        for _, r in page_df.iterrows():
-            nm = str(r.get("name", "(unnamed)"))
-            typ = str(r.get("claimedtype", ""))
-            row_labels[int(r["_rowid_"])] = f"{nm} | {typ} | rowid={int(r['_rowid_'])}"
-        selected_rowid = st.selectbox(t["choose_record"], row_options, format_func=lambda x: row_labels[x], key="detail_rowid")
-        detail = query_df(f"SELECT rowid AS _rowid_, * FROM {quote_identifier(TABLE)} WHERE rowid=?", (int(selected_rowid),))
-        if not detail.empty:
-            detail_long = pd.DataFrame({t["column"]: detail.columns, "Value": [str(v) if v is not None else "NULL" for v in detail.iloc[0].tolist()]})
-            st.dataframe(detail_long, use_container_width=True, hide_index=True, height=450)
-
-    st.divider()
-    if st.button(t["export"], key="prepare_csv", disabled=filtered_total == 0):
-        temp_path = None
-        try:
-            fd, temp_path = tempfile.mkstemp(prefix="space_observatory_", suffix=".csv")
-            import os
-            os.close(fd)
-            class BoundedTextWriter:
-                def __init__(self, handle, limit):
-                    self.handle, self.limit, self.written = handle, limit, 0
-                def write(self, text):
-                    size = len(text.encode("utf-8"))
-                    if self.written + size > self.limit:
-                        raise OverflowError("CSV exceeds configured size limit")
-                    self.written += size
-                    return self.handle.write(text)
-            conn = get_connection()
-            try:
-                cursor = conn.execute(f"SELECT * FROM {quote_identifier(TABLE)}{where_sql} ORDER BY rowid", params)
-                with open(temp_path, "w", encoding="utf-8-sig", newline="") as handle:
-                    writer = BoundedTextWriter(handle, CSV_MAX_BYTES)
-                    csv_writer = csv.writer(writer)
-                    csv_writer.writerow([d[0] for d in cursor.description])
-                    while True:
-                        batch = cursor.fetchmany(CSV_BATCH_SIZE)
-                        if not batch:
-                            break
-                        csv_writer.writerows([tuple(row) for row in batch])
-                cursor.close()
-            finally:
-                conn.close()
-            with open(temp_path, "rb") as f:
-                csv_bytes = f.read(CSV_MAX_BYTES + 1)
-            if len(csv_bytes) > CSV_MAX_BYTES:
-                raise OverflowError("CSV exceeds configured size limit")
-            st.session_state["csv_export_bytes"] = csv_bytes
-            st.session_state["csv_export_name"] = "space_observatory_filtered.csv"
-            st.success(t["export_ready"])
-        except OverflowError:
-            st.session_state.pop("csv_export_bytes", None)
-            st.error(t["export_too_large"])
-        except Exception as exc:
-            st.session_state.pop("csv_export_bytes", None)
-            st.error(t["export_error"] + str(exc))
-        finally:
-            if temp_path:
-                try:
-                    Path(temp_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-    if st.session_state.get("csv_export_bytes"):
-        st.download_button(
-            label="⬇ Download CSV" if lang == "EN" else ("⬇ Télécharger le CSV" if lang == "FR" else "⬇ Скачать CSV"),
-            data=st.session_state["csv_export_bytes"],
-            file_name=st.session_state.get("csv_export_name", "space_observatory_filtered.csv"),
-            mime="text/csv",
-            key="download_csv",
+        search = st.text_input(
+            t["search"],
+            placeholder=t["search_hint"],
+            key="catalogue_search"
         )
-        st.caption("CSV is generated in batches and capped at 50 MiB; the final download is held in app memory.")
+        f1, f2, f3 = st.columns([1.2, 1, 1])
+
+        with f1:
+            type_choice = st.selectbox(
+                t["type_filter"],
+                [t["all_types"]] + type_values,
+                key="type_choice"
+            )
+            selected_type = (
+                "__ALL__" if type_choice == t["all_types"]
+                else type_choice
+            )
+
+        with f2:
+            use_z = st.checkbox(
+                t["redshift_filter"],
+                value=False,
+                key="use_redshift"
+            )
+
+        with f3:
+            max_z = st.number_input(
+                t["max_redshift"],
+                min_value=0.0,
+                max_value=20.0,
+                value=1.5,
+                step=0.1,
+                disabled=not use_z,
+                key="max_redshift"
+            )
+
+        page_size = st.selectbox(
+            t["rows_per_page"], PAGE_SIZES, index=1, key="page_size"
+        )
+
+    where_sql, params = catalogue_filters(
+        search, selected_type, use_z, max_z
+    )
+
+    try:
+        filtered_total = catalogue_count(where_sql, params)
+        main_count = total_db_rows
+        ro_conn = get_rochester_connection()
+        try:
+            rochester_count = ro_conn.execute(
+                "SELECT COUNT(*) FROM rochester"
+            ).fetchone()[0]
+        finally:
+            ro_conn.close()
+
+        st.caption(
+            f"Combined catalogue: {main_count + rochester_count:,} records "
+            f"({main_count:,} main + {rochester_count:,} Rochester)"
+        )
+
+        pages = max(1, math.ceil(filtered_total / page_size))
+
+        if "catalogue_page" not in st.session_state:
+            st.session_state.catalogue_page = 1
+
+        st.session_state.catalogue_page = min(
+            max(1, int(st.session_state.catalogue_page)), pages
+        )
+
+        p1, p2, p3 = st.columns([1, 2, 1])
+
+        with p1:
+            if st.button(
+                "←",
+                disabled=st.session_state.catalogue_page <= 1,
+                key="prev_page"
+            ):
+                st.session_state.catalogue_page -= 1
+                st.rerun()
+
+        with p2:
+            st.markdown(
+                f"<div style='text-align:center;padding-top:8px'>"
+                f"{t['page']} <b>{st.session_state.catalogue_page}</b> "
+                f"{t['of']} {pages} · {t['records_found']}: "
+                f"<b>{filtered_total:,}</b></div>",
+                unsafe_allow_html=True
+            )
+
+        with p3:
+            if st.button(
+                "→",
+                disabled=st.session_state.catalogue_page >= pages,
+                key="next_page"
+            ):
+                st.session_state.catalogue_page += 1
+                st.rerun()
+
+        offset = (st.session_state.catalogue_page - 1) * page_size
+
+        page_df = catalogue_page(
+            where_sql, params, page_size, offset
+        )
+
+        st.subheader(t["results"])
+
+        if page_df.empty:
+            st.info(t["no_records"])
+        else:
+            display_df = page_df.drop(columns=["_id"])
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader(t["details"])
+
+            labels = [
+                f"{row['name']} | {row['claimedtype']} | {row['source']}"
+                for _, row in page_df.iterrows()
+            ]
+
+            selected_index = st.selectbox(
+                t["choose_record"],
+                range(len(labels)),
+                format_func=lambda i: labels[i],
+               key="combined_detail_choice_" + str(tuple(page_df["_id"].astype(str)))
+            )
+
+            selected = page_df.iloc[int(selected_index)]
+
+            detail = catalogue_detail(
+                selected["source"], selected["_id"]
+            )
+
+            if not detail.empty:
+                detail_long = pd.DataFrame({
+                    t["column"]: detail.columns,
+                    "Value": [
+                        str(v) if v is not None else "NULL"
+                        for v in detail.iloc[0].tolist()
+                    ]
+                })
+                st.dataframe(
+                    detail_long,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=450
+                )
+
+        st.divider()
+
+        if st.button(
+            t["export"],
+            key="prepare_csv",
+            disabled=filtered_total == 0
+        ):
+            export_df = catalogue_export(where_sql, params)
+            csv_bytes = export_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+
+            if len(csv_bytes) > CSV_MAX_BYTES:
+                st.error(t["export_too_large"])
+                st.session_state.pop("csv_export_bytes", None)
+            else:
+                st.session_state["csv_export_bytes"] = csv_bytes
+                st.session_state["csv_export_name"] = (
+                    "space_observatory_combined.csv"
+                )
+                st.success(t["export_ready"])
+
+        if st.session_state.get("csv_export_bytes"):
+            st.download_button(
+                label=(
+                    "⬇ Download CSV" if lang == "EN"
+                    else "⬇ Télécharger le CSV" if lang == "FR"
+                    else "⬇ Скачать CSV"
+                ),
+                data=st.session_state["csv_export_bytes"],
+                file_name=st.session_state.get(
+                    "csv_export_name",
+                    "space_observatory_combined.csv"
+                ),
+                mime="text/csv",
+                key="download_csv"
+            )
+
+    except Exception as exc:
+        st.error("Combined catalogue error: " + str(exc))
+
 
 # -----------------------------------------------------------------------------
 # Scientific analysis
