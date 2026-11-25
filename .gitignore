@@ -1,5 +1,7 @@
+
 *.db
 *.sqlite
+!rochester_2023_2026.sqlite
 *.sqlite3
 __pycache__/
 .venv/
