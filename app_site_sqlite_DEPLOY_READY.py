@@ -563,6 +563,9 @@ with st.sidebar:
         '<div class="author-label">DEVELOPER / AUTHOR</div>'
         '<div class="author-name">MBEMBA DIABANTSA LOICK JIREL</div>'
         '<div class="author-id">STUDENT ID: B23-105</div>'
+        '<hr style="border-color:rgba(220,176,83,.25);">'
+        '<div class="author-label">НАУЧНЫЙ РУКОВОДИТЕЛЬ</div>'
+        '<div class="author-name">АРХАНГЕЛЬСКАЯ ИРИНА ВЛАДИМИРОВНА</div>'
         '</div>',
         unsafe_allow_html=True,
     )
